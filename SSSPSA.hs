@@ -4,6 +4,9 @@ module SSSPSA (
     defSpsaParams,
   ) where
 
+import Control.Monad
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State.Strict
 import System.Random
 
 -- Scaled and shifted SPSA algorithm for stochastic functions optimisation
@@ -14,7 +17,7 @@ import System.Random
 -- We need to let some external process to get a sample of the function
 -- at some position, and this will happen generally in IO
 class Stochastic s where
-    play :: [Double] -> IO Double
+    play :: s -> [Double] -> IO Double
 
 -- Per dimension needed info
 data Dim = Dim {
@@ -31,7 +34,7 @@ data Dim = Dim {
                hil, hih :: Bool	-- hit low/high limit in alpha scaling
            }
 
-data State = State {
+data GState = GState {
                  pars :: Params,	-- we include the params in the state record
                  dims :: [Dim],		-- per dimension state
                  oscs :: [Bool],	-- already oscillated dimensions
@@ -40,7 +43,7 @@ data State = State {
              }
 
 -- Our monad stack
-type Optim a = StateT State IO a
+type Optim a = StateT GState IO a
 
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
@@ -60,7 +63,7 @@ data Params = Params {
 -- Default params
 defSpsaParams :: Params
 defSpsaParams = Params { phia = 10, c0 = 0.2, gam0 = 2, gami = 20, xstp = 0.5,
-                         nmax = 1000, h0 = 4, ka = 50, kc = 50, gmx = 20 }
+                         nmax = 1000, h0 = 4, ka = 50, kc = 50, gmax = 20, mmax = 1000 }
 
 -- Initialisation per dimension
 -- Expects: low, high and current (start point)
@@ -97,16 +100,16 @@ ascalStep par n dim = (s, dim { alf = a })
 -- Calculating the alpha' scaling factor for alpha
 -- Does not work for gradient 0
 {-# INLINE ascal #-}
-ascal :: Param -> Double -> Double -> Dim -> (Bool, Double)
+ascal :: Params -> Double -> Double -> Dim -> (Bool, Double)
 ascal par lim n dim
     | f > phia par = (False, alf dim * phia par)	-- limited scaling
     | f < 1        = (False, alf dim)			-- no scaling
     | otherwise    = (True,  alf dim * f)		-- exact scaling
-    where f = (lim - crt dim) / an dim n / gra dim
+    where f = (lim - crt dim) / ak dim n / gra dim
 
 -- Beta shifting step (per dimension)
 -- We expect here that the nxt field is not yet adjusted to the limits
-bshiftStep :: Param -> Double -> Dim -> Dim
+bshiftStep :: Params -> Double -> Dim -> Dim
 bshiftStep par n dim
     | ash dim >= ka par                 = dim
     | crt dim <= l && nxt dim > u       = beshi u
@@ -114,16 +117,16 @@ bshiftStep par n dim
     | otherwise                         = dim
     where l = lbk dim n
           u = ubk dim n
-          bshift delta = ceil (alf dim * gra dim / (delta - crt dim) - n - bet dim)
+          bshift delta = ceiling (alf dim * gra dim / (delta - crt dim) - n - bet dim)
           beshi r = dim { bet = b, vak = v, ash = ash dim + 1 }
-              where b' = bshift $ r - crt dim
+              where b' = fromIntegral $ bshift $ r - crt dim
                     (bp, v) | b' > vak dim = (vak dim, vak dim * 2)
                             | otherwise    = (b',      vak dim)
                     b = bet dim + bp
 
-cscalStep :: Param -> Double -> Dim -> Dim
+cscalStep :: Params -> Double -> Dim -> Dim
 cscalStep par n dim
-    | csc dim < kc par
+    | csc dim < kc par &&
       (  crt dim == ubk dim n && nxt dim > crt dim
       || crt dim == lbk dim n && nxt dim < crt dim) = dim { gam = gam dim * gap, csc = csc dim + 1 }
     | otherwise                                     = dim
@@ -132,7 +135,7 @@ cscalStep par n dim
 -- Adding here means: we maximise
 nextPoint :: Double -> Dim -> Dim
 nextPoint n dim = dim { nxt = x }
-    where x = crt dim + ak dim n * grd dim
+    where x = crt dim + ak dim n * gra dim
 
 -- Prepare next step, updating and projecting crt point
 nextStep :: Double -> Dim -> Dim
@@ -143,28 +146,28 @@ nextStep n dim = dim { crt = x }
 
 -- The norm for the termination condition
 dist1 :: [Double] -> [Double] -> Double
-dist1  = maximum . map abs . zipWith subtract
+dist1 as bs = maximum $ map abs $ zipWith subtract as bs
 
 -- Uniformly random +/-1
-randSign :: IO Double
+randSign :: IO Int
 randSign = do
     r <- getStdRandom (randomR (1,2))
     case r of
-        1 -> return (-1)
-        2 -> return 1
+        1 -> return r
+        2 -> return (-1)
 
 -- Calculate gradient
-calcGrad :: Stochastic s => Double -> [Dim] -> IO [Dim]
-calcGrad n ds = do
+calcGrad :: Stochastic s => s -> Double -> [Dim] -> IO [Dim]
+calcGrad s n ds = do
     let xs = map crt ds
     dx <- forM ds $ \dim -> do
               d <- randSign
-              return $ d * cn dim n
+              return $ fromIntegral d * ck dim n
     let xp = zipWith (+) xs dx
         xm = zipWith subtract xs dx
-    fp <- play xp
-    fm <- play xm
-    let dgrad dim delta = dim { grd = (fp - fm) / delta }
+    fp <- play s xp
+    fm <- play s xm
+    let dgrad dim delta = dim { gra = (fp - fm) / delta }
     return $ zipWith dgrad ds dx
 
 doUntil :: Monad m => m Bool -> m ()
@@ -173,30 +176,30 @@ doUntil act = go
               r <- act
               if r then return () else go
 
-ssSPSA :: Params -> [((Double, Double), Double)]
-ssSPSA params dlucs = runStateT spsa stat
-    where stat = State { pars = params, dims = ds, oscs = os, step = 1, grde = 0 }
-          ds = map (\(l, u), c) -> startDim params l u c) dlucs,
+ssSPSA :: Stochastic s => s -> Params -> [((Double, Double), Double)] -> IO [Double]
+ssSPSA s params dlucs = liftM fst $ runStateT (spsa s) stat
+    where stat = GState { pars = params, dims = ds, oscs = os, step = 1, grde = 0 }
+          ds = map (\((l, u), c) -> startDim params l u c) dlucs
           os = take (length ds) $ repeat False
 
-spsa :: Optim [Double]
-spsa = do
-    doUntil scaleStep
-    doUntil shiftStep
-    gets $ map crt dims
+spsa :: Stochastic s => s -> Optim [Double]
+spsa s = do
+    doUntil $ scaleStep s
+    doUntil $ shiftStep s
+    gets $ map crt . dims
 
-scaleStep :: Optim Bool
-scaleStep = do
-    stat <- lift get
+scaleStep :: Stochastic s => s -> Optim Bool
+scaleStep s = do
+    stat <- get
     let params = pars stat
-    if step state > h0 params || grde state > gmax params || all (oscs stat)
+    if step stat > h0 params || grde stat > gmax params || all id (oscs stat)
        then return True
        else do
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad nn (dims stat)
+           d1s <- lift $ calcGrad s nn (dims stat)
            let -- next point (not adjusted to the limits)
-               ds = map nextPoint d1s
+               ds = map (nextPoint nn) d1s
                -- a sequence scaling
                fas osc dim | osc       = (osc, dim)	-- already oscillated
                            | otherwise = ascalStep params nn dim
@@ -205,27 +208,27 @@ scaleStep = do
                dcs | step stat > mmax params = das
                    | otherwise               = map (cscalStep params nn) das
                -- next point
-               dns = map nextStep dcs
-           lift $ put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
+               dns = map (nextStep nn) dcs
+           put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
            return False
 
-shiftStep :: Optim Bool
-shiftStep = do
+shiftStep :: Stochastic s => s -> Optim Bool
+shiftStep s = do
     stat <- get
     let params = pars stat
-    if step state > nmax params	-- max number of steps
-       || dist1 (map crt (dims stat)) (map nxt (dims stat)) < xtrm params
+    if step stat > nmax params	-- max number of steps
+       || dist1 (map crt (dims stat)) (map nxt (dims stat)) < xstp params
        then return True
        else do
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad nn (dims stat)
+           d1s <- lift $ calcGrad s nn (dims stat)
            let -- next point (not adjusted to the limits)
-               ds = map nextPoint d1s
+               ds = map (nextPoint nn) d1s
                -- a sequence shifting
                das | step stat > mmax params = ds
                    | otherwise               = map (bshiftStep params nn) ds
                -- next point
-               dns = map nextStep das
-           lift $ put stat { dims = dns, step = step stat + 1, grde = grde stat + 1 }
+               dns = map (nextStep nn) das
+           put stat { dims = dns, step = step stat + 1, grde = grde stat + 1 }
            return False
