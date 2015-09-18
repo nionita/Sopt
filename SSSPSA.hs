@@ -30,16 +30,18 @@ data Dim = Dim {
                gra      :: !Double,	-- current gradient value
                nxt      :: !Double,	-- next value
                ash      :: !Int,	-- number of a shifts so far
-               csc      :: !Int,	-- number of c sclaes so far
-               hil, hih :: Bool	-- hit low/high limit in alpha scaling
+               csc      :: !Int		-- number of c sclaes so far
            }
+           deriving Show
 
 data GState = GState {
                  pars :: Params,	-- we include the params in the state record
                  dims :: [Dim],		-- per dimension state
                  oscs :: [Bool],	-- already oscillated dimensions
                  step :: !Int,		-- current step
-                 grde :: !Int		-- number of gradient estimations
+                 grde :: !Int,		-- number of gradient estimations
+                 sstp :: !Int,		-- steps close to termination
+                 cnxx :: !Double	-- distance between crt & nxt
              }
 
 -- Our monad stack
@@ -47,6 +49,7 @@ type Optim a = StateT GState IO a
 
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
+                  verb :: !Bool,	-- verbose?
                   phia :: !Double,	-- maximul alpha scaling factor
                   c0   :: !Double,	-- define the maximum gamma: fraction from initial interval
                   gam0 :: !Double,	-- gamma scaling factor
@@ -57,13 +60,15 @@ data Params = Params {
                   ka   :: !Int,		-- maximum number of a(n) shifts per dimension
                   kc   :: !Int,		-- maximum number of c(n) scale ups per dimension
                   gmax :: !Int,		-- max allowed gradients for occilation phase
-                  mmax :: !Int		-- max step to which shifts/scalings are allowed
+                  mmax :: !Int,		-- max step to which shifts/scalings are allowed
+                  nstp :: !Int		-- steps to stay close for termination
               }
+              deriving Show
 
 -- Default params
 defSpsaParams :: Params
-defSpsaParams = Params { phia = 10, c0 = 0.2, gam0 = 2, gami = 20, xstp = 0.5,
-                         nmax = 1000, h0 = 4, ka = 50, kc = 50, gmax = 20, mmax = 1000 }
+defSpsaParams = Params { verb = False, phia = 10, c0 = 0.2, gam0 = 2, gami = 20, xstp = 1/1000000,
+                         nmax = 1000, h0 = 4, ka = 50, kc = 50, gmax = 20, mmax = 1000, nstp = 3 }
 
 -- Initialisation per dimension
 -- Expects: low, high and current (start point)
@@ -71,8 +76,7 @@ startDim :: Params -> Double -> Double -> Double -> Dim
 startDim par l h c
     = Dim { low = l, hig = h, alf = 1, bet = 0, vak = 10,
             gam = (h - l) / gami par, cmx = c0 par * (h - l), crt = c,
-            gra = 0, nxt = 0, ash = 0, csc = 0,
-            hil = False, hih = False }
+            gra = 0, nxt = 0, ash = 0, csc = 0 }
 
 -- Calculate a(n) sequence
 ak :: Dim -> Double -> Double
@@ -163,12 +167,15 @@ calcGrad s n ds = do
     dx <- forM ds $ \dim -> do
               d <- randSign
               return $ fromIntegral d * ck dim n
-    let xp = zipWith (+) xs dx
-        xm = zipWith subtract xs dx
+    let xp = zipWith (+)      dx xs
+        xm = zipWith subtract dx xs
     fp <- play s xp
+    putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
     fm <- play s xm
+    putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
     let dgrad dim delta = dim { gra = (fp - fm) / delta }
-    return $ zipWith dgrad ds dx
+        dgs = zipWith dgrad ds dx
+    return dgs
 
 doUntil :: Monad m => m Bool -> m ()
 doUntil act = go
@@ -178,7 +185,8 @@ doUntil act = go
 
 ssSPSA :: Stochastic s => s -> Params -> [((Double, Double), Double)] -> IO [Double]
 ssSPSA s params dlucs = liftM fst $ runStateT (spsa s) stat
-    where stat = GState { pars = params, dims = ds, oscs = os, step = 1, grde = 0 }
+    where stat = GState { pars = params, dims = ds, oscs = os, step = 1,
+                          grde = 0, sstp = 0, cnxx = 0 }
           ds = map (\((l, u), c) -> startDim params l u c) dlucs
           os = take (length ds) $ repeat False
 
@@ -193,11 +201,24 @@ scaleStep s = do
     stat <- get
     let params = pars stat
     if step stat > h0 params || grde stat > gmax params || all id (oscs stat)
-       then return True
+       then do
+           when (verb params) $ do
+               if step stat > h0 params
+                  then info $ "Scaling termination: h0 steps reached"
+                  else if grde stat > gmax params
+                          then info $ "Scaling termination: max gradient reached"
+                          else info $ "Scaling termination: all dimensions scaled"
+           return True
        else do
+           when (verb params) $ do
+               info $ "Step " ++ show (step stat) ++ " (scale)"
+               info $ "Crt = " ++ show (map crt (dims stat))
+               info $ "Dims = " ++ show (dims stat)
+               info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
            d1s <- lift $ calcGrad s nn (dims stat)
+           when (verb params) $ info $ "Gra = " ++ show d1s
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
                -- a sequence scaling
@@ -217,18 +238,70 @@ shiftStep s = do
     stat <- get
     let params = pars stat
     if step stat > nmax params	-- max number of steps
-       || dist1 (map crt (dims stat)) (map nxt (dims stat)) < xstp params
-       then return True
+       || (cnxx stat < xstp params && sstp stat >= nstp params)
+       then do
+           when (verb params) $ do
+               if step stat > nmax params
+                  then info $ "Termination: nmax steps reached"
+                  else info $ "Termination: optimum near enough"
+               info $ "Crt = " ++ show (map crt (dims stat))
+               info $ "Dims = " ++ show (dims stat)
+           return True
        else do
+           when (verb params) $ do
+               info $ "Step " ++ show (step stat) ++ " (shift)"
+               info $ "Dims = " ++ show (dims stat)
+               info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
            d1s <- lift $ calcGrad s nn (dims stat)
+           when (verb params) $ info $ "Gra = " ++ show d1s
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
                -- a sequence shifting
                das | step stat > mmax params = ds
                    | otherwise               = map (bshiftStep params nn) ds
+               xx = dist1 (map crt (dims stat)) (map nxt ds)
                -- next point
                dns = map (nextStep nn) das
-           put stat { dims = dns, step = step stat + 1, grde = grde stat + 1 }
+               near | xx < xstp params = sstp stat + 1
+                    | otherwise        = 0
+           when (verb params) $ info $ "Dist1 = " ++ show xx
+           put stat { dims = dns, step = step stat + 1, grde = grde stat + 1, sstp = near, cnxx = xx }
            return False
+
+info :: String -> Optim ()
+info = lift . putStrLn
+
+------------------------
+-- Test optimisations --
+------------------------
+
+-- 1 dimension, no noise: a simple quadratic funtion with maximum in -10
+data OneDimExact = OneDimExact
+
+instance Stochastic OneDimExact where
+    play = playOneDimExact
+
+playOneDimExact :: OneDimExact -> [Double] -> IO Double
+playOneDimExact _ (x:_) = return $ 1 - 0.1 * (x+10) * (x+10)
+
+maxOneDimExact n = ssSPSA OneDimExact
+                          defSpsaParams { verb = True, nmax = n }
+                          [((-50, 100), 50)]
+
+-- Same with noise:
+data OneDimNoise = OneDimNoise
+
+instance Stochastic OneDimNoise where
+    play = playOneDimNoise
+
+playOneDimNoise :: OneDimNoise -> [Double] -> IO Double
+playOneDimNoise _ (x:_) = do
+    r <- getStdRandom (randomR (-n,n))
+    return $ 1 - 0.1 * (x+10) * (x+10) + r
+    where n = 0.5
+
+maxOneDimNoise n = ssSPSA OneDimNoise
+                          defSpsaParams { verb = True, nmax = n }
+                          [((-50, 100), 50)]
