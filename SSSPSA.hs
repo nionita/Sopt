@@ -16,8 +16,7 @@ import System.Random
 
 -- We need to let some external process to get a sample of the function
 -- at some position, and this will happen generally in IO
-class Stochastic s where
-    play :: s -> [Double] -> IO Double
+type Stochastic = [Double] -> IO Double
 
 -- Per dimension needed info
 data Dim = Dim {
@@ -161,17 +160,17 @@ randSign = do
         2 -> return (-1)
 
 -- Calculate gradient
-calcGrad :: Stochastic s => s -> Double -> [Dim] -> IO [Dim]
-calcGrad s n ds = do
+calcGrad :: Stochastic -> Double -> [Dim] -> IO [Dim]
+calcGrad play n ds = do
     let xs = map crt ds
     dx <- forM ds $ \dim -> do
               d <- randSign
               return $ fromIntegral d * ck dim n
     let xp = zipWith (+)      dx xs
         xm = zipWith subtract dx xs
-    fp <- play s xp
+    fp <- play xp
     putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
-    fm <- play s xm
+    fm <- play xm
     putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
     let dgrad dim delta = dim { gra = (fp - fm) / delta }
         dgs = zipWith dgrad ds dx
@@ -183,21 +182,21 @@ doUntil act = go
               r <- act
               if r then return () else go
 
-ssSPSA :: Stochastic s => s -> Params -> [((Double, Double), Double)] -> IO [Double]
-ssSPSA s params dlucs = liftM fst $ runStateT (spsa s) stat
+ssSPSA :: Stochastic -> Params -> [((Double, Double), Double)] -> IO [Double]
+ssSPSA play params dlucs = liftM fst $ runStateT (spsa play) stat
     where stat = GState { pars = params, dims = ds, oscs = os, step = 1,
                           grde = 0, sstp = 0, cnxx = 0 }
           ds = map (\((l, u), c) -> startDim params l u c) dlucs
           os = take (length ds) $ repeat False
 
-spsa :: Stochastic s => s -> Optim [Double]
-spsa s = do
-    doUntil $ scaleStep s
-    doUntil $ shiftStep s
+spsa :: Stochastic -> Optim [Double]
+spsa play = do
+    doUntil $ scaleStep play
+    doUntil $ shiftStep play
     gets $ map crt . dims
 
-scaleStep :: Stochastic s => s -> Optim Bool
-scaleStep s = do
+scaleStep :: Stochastic -> Optim Bool
+scaleStep play = do
     stat <- get
     let params = pars stat
     if step stat > h0 params || grde stat > gmax params || all id (oscs stat)
@@ -211,13 +210,14 @@ scaleStep s = do
            return True
        else do
            when (verb params) $ do
+               info ""
                info $ "Step " ++ show (step stat) ++ " (scale)"
                info $ "Crt = " ++ show (map crt (dims stat))
                info $ "Dims = " ++ show (dims stat)
                info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad s nn (dims stat)
+           d1s <- lift $ calcGrad play nn (dims stat)
            when (verb params) $ info $ "Gra = " ++ show d1s
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
@@ -233,8 +233,8 @@ scaleStep s = do
            put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
            return False
 
-shiftStep :: Stochastic s => s -> Optim Bool
-shiftStep s = do
+shiftStep :: Stochastic -> Optim Bool
+shiftStep play = do
     stat <- get
     let params = pars stat
     if step stat > nmax params	-- max number of steps
@@ -249,12 +249,13 @@ shiftStep s = do
            return True
        else do
            when (verb params) $ do
+               info ""
                info $ "Step " ++ show (step stat) ++ " (shift)"
                info $ "Dims = " ++ show (dims stat)
                info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad s nn (dims stat)
+           d1s <- lift $ calcGrad play nn (dims stat)
            when (verb params) $ info $ "Gra = " ++ show d1s
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
@@ -278,30 +279,31 @@ info = lift . putStrLn
 ------------------------
 
 -- 1 dimension, no noise: a simple quadratic funtion with maximum in -10
-data OneDimExact = OneDimExact
+oneDim :: [Double] -> IO Double
+oneDim (x:_) = return $ 1 - 0.1 * (x+10) * (x+10)
 
-instance Stochastic OneDimExact where
-    play = playOneDimExact
-
-playOneDimExact :: OneDimExact -> [Double] -> IO Double
-playOneDimExact _ (x:_) = return $ 1 - 0.1 * (x+10) * (x+10)
-
-maxOneDimExact n = ssSPSA OneDimExact
+maxOneDimExact n = ssSPSA oneDim
                           defSpsaParams { verb = True, nmax = n }
                           [((-50, 100), 50)]
 
--- Same with noise:
-data OneDimNoise = OneDimNoise
+-- Same with noise: noise with a general level
+withNoise :: Double -> Stochastic -> [Double] -> IO Double
+withNoise noise play xs = do
+    y <- play xs
+    r <- getStdRandom (randomR (-noise, noise))
+    return $ y + r
 
-instance Stochastic OneDimNoise where
-    play = playOneDimNoise
-
-playOneDimNoise :: OneDimNoise -> [Double] -> IO Double
-playOneDimNoise _ (x:_) = do
-    r <- getStdRandom (randomR (-n,n))
-    return $ 1 - 0.1 * (x+10) * (x+10) + r
-    where n = 0.5
-
-maxOneDimNoise n = ssSPSA OneDimNoise
+maxOneDimNoise n = ssSPSA (withNoise 0.5 oneDim)
                           defSpsaParams { verb = True, nmax = n }
                           [((-50, 100), 50)]
+
+-- 2 dimension: negated banana, no noise, (global) maximum at (1, 1)
+banana :: [Double] -> IO Double
+banana (x:y:_) = return $ negate $ x1 * x1 + 10 * y1 * y1
+    where x1 = 1 - x
+          x2 = x * x
+          y1 = y - x2
+
+maxBanana n = ssSPSA banana
+                     defSpsaParams { verb = True, nmax = n }
+                     [((-50, 100), 50), ((-50, 100), 50)]
