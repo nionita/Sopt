@@ -9,3 +9,6 @@ dist
 *.ods
 *.swp
 *.log
+*.pdf
+.stack-work
+stack_path

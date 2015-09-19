@@ -1,5 +1,5 @@
 module SSSPSA (
-    ssSPSA,	-- the optimisation function
+    ssSPSA,         -- the optimisation function
     Params(..),
     defSpsaParams,
   ) where
@@ -20,27 +20,27 @@ type Stochastic = [Double] -> IO Double
 
 -- Per dimension needed info
 data Dim = Dim {
-               low, hig :: !Double,	-- range of dimension
-               alf, bet :: !Double,	-- parameters of a(n) sequence
-               vak      :: !Double,	-- shift upper bound
-               gam      :: !Double,	-- parameter of c(n) sequence
-               cmx      :: !Double,	-- maximum for c(n) sequence
-               crt      :: !Double,	-- current value
-               gra      :: !Double,	-- current gradient value
-               nxt      :: !Double,	-- next value
-               ash      :: !Int,	-- number of a shifts so far
-               csc      :: !Int		-- number of c sclaes so far
+               low, hig :: !Double,     -- range of dimension
+               alf, bet :: !Double,     -- parameters of a(n) sequence
+               vak      :: !Double,     -- shift upper bound
+               gam      :: !Double,     -- parameter of c(n) sequence
+               cmx      :: !Double,     -- maximum for c(n) sequence
+               crt      :: !Double,     -- current value
+               gra      :: !Double,     -- current gradient value
+               nxt      :: !Double,     -- next value
+               ash      :: !Int,        -- number of a shifts so far
+               csc      :: !Int         -- number of c sclaes so far
            }
            deriving Show
 
 data GState = GState {
-                 pars :: Params,	-- we include the params in the state record
-                 dims :: [Dim],		-- per dimension state
-                 oscs :: [Bool],	-- already oscillated dimensions
-                 step :: !Int,		-- current step
-                 grde :: !Int,		-- number of gradient estimations
-                 sstp :: !Int,		-- steps close to termination
-                 cnxx :: !Double	-- distance between crt & nxt
+                 pars :: Params,         -- we include the params in the state record
+                 dims :: [Dim],          -- per dimension state
+                 oscs :: [Bool],         -- already oscillated dimensions
+                 step :: !Int,           -- current step
+                 grde :: !Int,           -- number of gradient estimations
+                 sstp :: !Int,           -- steps close to termination
+                 cnxx :: !Double         -- distance between crt & nxt
              }
 
 -- Our monad stack
@@ -48,19 +48,19 @@ type Optim a = StateT GState IO a
 
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
-                  verb :: !Bool,	-- verbose?
-                  phia :: !Double,	-- maximul alpha scaling factor
-                  c0   :: !Double,	-- define the maximum gamma: fraction from initial interval
-                  gam0 :: !Double,	-- gamma scaling factor
-                  gami :: !Double,	-- fraction from initial interval for initial gamma
-                  xstp :: !Double,	-- termination when norm1 (xn -xc) < xstp
-                  nmax :: !Int,		-- maximum number of steps at all
-                  h0   :: !Int,		-- max steps for oscillations (a scaling)
-                  ka   :: !Int,		-- maximum number of a(n) shifts per dimension
-                  kc   :: !Int,		-- maximum number of c(n) scale ups per dimension
-                  gmax :: !Int,		-- max allowed gradients for occilation phase
-                  mmax :: !Int,		-- max step to which shifts/scalings are allowed
-                  nstp :: !Int		-- steps to stay close for termination
+                  verb :: !Bool,       -- verbose?
+                  phia :: !Double,     -- maximul alpha scaling factor
+                  c0   :: !Double,     -- define the maximum gamma: fraction from initial interval
+                  gam0 :: !Double,     -- gamma scaling factor
+                  gami :: !Double,     -- fraction from initial interval for initial gamma
+                  xstp :: !Double,     -- termination when norm1 (xn -xc) < xstp
+                  nmax :: !Int,        -- maximum number of steps at all
+                  h0   :: !Int,        -- max steps for oscillations (a scaling)
+                  ka   :: !Int,        -- maximum number of a(n) shifts per dimension
+                  kc   :: !Int,        -- maximum number of c(n) scale ups per dimension
+                  gmax :: !Int,        -- max allowed gradients for occilation phase
+                  mmax :: !Int,        -- max step to which shifts/scalings are allowed
+                  nstp :: !Int         -- steps to stay close for termination
               }
               deriving Show
 
@@ -98,16 +98,16 @@ ascalStep :: Params -> Double -> Dim -> (Bool, Dim)
 ascalStep par n dim = (s, dim { alf = a })
     where (s, a) | gra dim > 0 = ascal par (ubk dim n) n dim
                  | gra dim < 0 = ascal par (lbk dim n) n dim
-                 | otherwise   = (False, alf dim)	-- no scaling when gradient is 0
+                 | otherwise   = (False, alf dim)     -- no scaling when gradient is 0
 
 -- Calculating the alpha' scaling factor for alpha
 -- Does not work for gradient 0
 {-# INLINE ascal #-}
 ascal :: Params -> Double -> Double -> Dim -> (Bool, Double)
 ascal par lim n dim
-    | f > phia par = (False, alf dim * phia par)	-- limited scaling
-    | f < 1        = (True,  alf dim)			-- no scaling needed
-    | otherwise    = (True,  al1)			-- exact scaling
+    | f > phia par = (False, alf dim * phia par)  -- limited scaling
+    | f < 1        = (True,  alf dim)             -- no scaling needed
+    | otherwise    = (True,  al1)                 -- exact scaling
     where al1 = (lim - crt dim) / (nxt dim - crt dim)
           f   = al1 / alf dim
 
@@ -225,7 +225,7 @@ scaleStep play = do
                ds = map (nextPoint nn) d1s
            when (verb params) $ info $ "Nxt = " ++ show (map nxt ds)
            let -- a sequence scaling
-               fas osc dim | osc       = (osc, dim)	-- already oscillated
+               fas osc dim | osc       = (osc, dim)     -- already oscillated
                            | otherwise = ascalStep params nn dim
                (oas, das) = unzip $ zipWith fas (oscs stat) ds
            when (verb params) $ info $ "Alf = " ++ show (map alf das)
@@ -243,7 +243,7 @@ shiftStep :: Stochastic -> Optim Bool
 shiftStep play = do
     stat <- get
     let params = pars stat
-    if step stat > nmax params	-- max number of steps
+    if step stat > nmax params     -- max number of steps
        || (cnxx stat < xstp params && sstp stat >= nstp params)
        then do
            when (verb params) $ do
