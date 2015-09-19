@@ -106,21 +106,24 @@ ascalStep par n dim = (s, dim { alf = a })
 ascal :: Params -> Double -> Double -> Dim -> (Bool, Double)
 ascal par lim n dim
     | f > phia par = (False, alf dim * phia par)	-- limited scaling
-    | f < 1        = (False, alf dim)			-- no scaling
-    | otherwise    = (True,  alf dim * f)		-- exact scaling
-    where f = (lim - crt dim) / ak dim n / gra dim
+    | f < 1        = (True,  alf dim)			-- no scaling needed
+    | otherwise    = (True,  al1)			-- exact scaling
+    where al1 = (lim - crt dim) / (nxt dim - crt dim)
+          f   = al1 / alf dim
 
 -- Beta shifting step (per dimension)
 -- We expect here that the nxt field is not yet adjusted to the limits
 bshiftStep :: Params -> Double -> Dim -> Dim
 bshiftStep par n dim
     | ash dim >= ka par                 = dim
-    | crt dim <= l && nxt dim > u       = beshi u
-    | crt dim >= u && nxt dim < l       = beshi l
+    | crt dim <= l1 && nxt dim > u2     = beshi u2
+    | crt dim >= u1 && nxt dim < l2     = beshi l2
     | otherwise                         = dim
-    where l = lbk dim n
-          u = ubk dim n
-          bshift delta = ceiling (alf dim * gra dim / (delta - crt dim) - n - bet dim)
+    where l1 = lbk dim n
+          u1 = ubk dim n
+          l2 = lbk dim (n+1)
+          u2 = ubk dim (n+1)
+          bshift delta = ceiling (alf dim * gra dim / delta - n - bet dim)
           beshi r = dim { bet = b, vak = v, ash = ash dim + 1 }
               where b' = fromIntegral $ bshift $ r - crt dim
                     (bp, v) | b' > vak dim = (vak dim, vak dim * 2)
@@ -130,8 +133,8 @@ bshiftStep par n dim
 cscalStep :: Params -> Double -> Dim -> Dim
 cscalStep par n dim
     | csc dim < kc par &&
-      (  crt dim == ubk dim n && nxt dim > crt dim
-      || crt dim == lbk dim n && nxt dim < crt dim) = dim { gam = gam dim * gap, csc = csc dim + 1 }
+      (  crt dim >= ubk dim n && nxt dim > crt dim
+      || crt dim <= lbk dim n && nxt dim < crt dim) = dim { gam = gam dim * gap, csc = csc dim + 1 }
     | otherwise                                     = dim
     where gap = min (gam0 par) $ cmx dim / ck dim n
 
@@ -160,8 +163,8 @@ randSign = do
         2 -> return (-1)
 
 -- Calculate gradient
-calcGrad :: Stochastic -> Double -> [Dim] -> IO [Dim]
-calcGrad play n ds = do
+calcGrad :: Bool -> Stochastic -> Double -> [Dim] -> IO [Dim]
+calcGrad verb play n ds = do
     let xs = map crt ds
     dx <- forM ds $ \dim -> do
               d <- randSign
@@ -169,9 +172,9 @@ calcGrad play n ds = do
     let xp = zipWith (+)      dx xs
         xm = zipWith subtract dx xs
     fp <- play xp
-    putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
+    when verb $ putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
     fm <- play xm
-    putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
+    when verb $ putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
     let dgrad dim delta = dim { gra = (fp - fm) / delta }
         dgs = zipWith dgrad ds dx
     return dgs
@@ -212,24 +215,27 @@ scaleStep play = do
            when (verb params) $ do
                info ""
                info $ "Step " ++ show (step stat) ++ " (scale)"
-               info $ "Crt = " ++ show (map crt (dims stat))
-               info $ "Dims = " ++ show (dims stat)
+               info $ "Crt = " ++ show (map crt $ dims stat)
                info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad play nn (dims stat)
-           when (verb params) $ info $ "Gra = " ++ show d1s
+           d1s <- lift $ calcGrad (verb params) play nn (dims stat)
+           when (verb params) $ info $ "Gra = " ++ show (map gra d1s)
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
-               -- a sequence scaling
+           when (verb params) $ info $ "Nxt = " ++ show (map nxt ds)
+           let -- a sequence scaling
                fas osc dim | osc       = (osc, dim)	-- already oscillated
                            | otherwise = ascalStep params nn dim
                (oas, das) = unzip $ zipWith fas (oscs stat) ds
-               -- c sequence scaling
+           when (verb params) $ info $ "Alf = " ++ show (map alf das)
+           let -- c sequence scaling
                dcs | step stat > mmax params = das
                    | otherwise               = map (cscalStep params nn) das
-               -- next point
+           when (verb params) $ info $ "Gam = " ++ show (map gam dcs)
+           let -- next point
                dns = map (nextStep nn) dcs
+           when (verb params) $ info $ "Crt = " ++ show (map crt dns)
            put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
            return False
 
@@ -251,23 +257,33 @@ shiftStep play = do
            when (verb params) $ do
                info ""
                info $ "Step " ++ show (step stat) ++ " (shift)"
-               info $ "Dims = " ++ show (dims stat)
+               info $ "Crt = " ++ show (map crt $ dims stat)
                info $ "calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad play nn (dims stat)
-           when (verb params) $ info $ "Gra = " ++ show d1s
+           d1s <- lift $ calcGrad (verb params) play nn (dims stat)
+           when (verb params) $ info $ "Gra = " ++ show (map gra d1s)
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
-               -- a sequence shifting
+           when (verb params) $ info $ "Nxt = " ++ show (map nxt ds)
+           let -- a sequence shifting
                das | step stat > mmax params = ds
                    | otherwise               = map (bshiftStep params nn) ds
-               xx = dist1 (map crt (dims stat)) (map nxt ds)
-               -- next point
-               dns = map (nextStep nn) das
+           when (verb params) $ do
+               info $ "Bet = " ++ show (map bet das)
+               info $ "Vak = " ++ show (map vak das)
+           let -- c sequence scaling
+               dcs | step stat > mmax params = das
+                   | otherwise               = map (cscalStep params nn) das
+           when (verb params) $ info $ "Gam = " ++ show (map gam dcs)
+           let -- next point, distance in parameter space (for termination)
+               xx  = dist1 (map crt dcs) (map nxt dcs)
+               dns = map (nextStep nn) dcs
                near | xx < xstp params = sstp stat + 1
                     | otherwise        = 0
-           when (verb params) $ info $ "Dist1 = " ++ show xx
+           when (verb params) $ do
+               info $ "Crt = " ++ show (map crt dns)
+               info $ "Dist1 = " ++ show xx
            put stat { dims = dns, step = step stat + 1, grde = grde stat + 1, sstp = near, cnxx = xx }
            return False
 
@@ -305,5 +321,5 @@ banana (x:y:_) = return $ negate $ x1 * x1 + 10 * y1 * y1
           y1 = y - x2
 
 maxBanana n = ssSPSA banana
-                     defSpsaParams { verb = True, nmax = n }
-                     [((-50, 100), 50), ((-50, 100), 50)]
+                     defSpsaParams { nmax = n, mmax = n, xstp = 0.001 }
+                     [((-10, 10), 5), ((-10, 10), 5)]
