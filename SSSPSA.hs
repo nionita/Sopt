@@ -49,7 +49,7 @@ type Optim a = StateT GState IO a
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
                   verb :: !Bool,       -- verbose?
-                  phia :: !Double,     -- maximul alpha scaling factor
+                  phia :: !Double,     -- maximal alpha scaling factor
                   c0   :: !Double,     -- define the maximum gamma: fraction from initial interval
                   gam0 :: !Double,     -- gamma scaling factor
                   gami :: !Double,     -- fraction from initial interval for initial gamma
@@ -175,7 +175,7 @@ calcGrad verb play n ds = do
     when verb $ putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
     fm <- play xm
     when verb $ putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
-    let dgrad dim delta = dim { gra = (fp - fm) / delta }
+    let dgrad dim delta = dim { gra = (fp - fm) / delta / 2 }	-- gradient was too big!
         dgs = zipWith dgrad ds dx
     return dgs
 
