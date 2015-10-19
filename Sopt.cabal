@@ -58,7 +58,8 @@ library
   
   -- Other library packages from which modules are imported.
   build-depends:       base >=4.8 && <4.9, random >=1.1,
-                       transformers
+                       transformers, bytestring, cereal, 
+                       directory, filepath
   
   -- Directories containing source files.
   -- hs-source-dirs:      

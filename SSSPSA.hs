@@ -1,12 +1,20 @@
+{-# LANGUAGE DeriveGeneric #-}
+
 module SSSPSA (
     ssSPSA,         -- the optimisation function
     Params(..),
+    StartOptions(..),
     defSpsaParams,
   ) where
 
 import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State.Strict
+import qualified Data.ByteString.Lazy as BL
+import Data.Serialize (Serialize, encodeLazy, decodeLazy)
+import GHC.Generics
+import System.Directory
+import System.FilePath
 import System.Random
 
 -- Scaled and shifted SPSA algorithm for stochastic functions optimisation
@@ -17,6 +25,11 @@ import System.Random
 -- We need to let some external process to get a sample of the function
 -- at some position, and this will happen generally in IO
 type Stochastic = [Double] -> IO Double
+type ORange = ((Double, Double), Double)
+data StartOptions
+    = SOStartWithCheckpoint FilePath [ORange]
+    | SOStartNoCheckpoint            [ORange]
+    | SORestart             FilePath
 
 -- Per dimension needed info
 data Dim = Dim {
@@ -31,17 +44,19 @@ data Dim = Dim {
                ash      :: !Int,        -- number of a shifts so far
                csc      :: !Int         -- number of c sclaes so far
            }
-           deriving Show
+           deriving (Show, Generic)
 
 data GState = GState {
                  pars :: Params,         -- we include the params in the state record
+                 save :: Maybe FilePath, -- file to use for checkpoints
+                 rfil :: FilePath,       -- running file name (delete to stop asap)
                  dims :: [Dim],          -- per dimension state
                  oscs :: [Bool],         -- already oscillated dimensions
                  step :: !Int,           -- current step
                  grde :: !Int,           -- number of gradient estimations
                  sstp :: !Int,           -- steps close to termination
                  cnxx :: !Double         -- distance between crt & nxt
-             }
+             } deriving Generic
 
 -- Our monad stack
 type Optim a = StateT GState IO a
@@ -62,7 +77,12 @@ data Params = Params {
                   mmax :: !Int,        -- max step to which shifts/scalings are allowed
                   nstp :: !Int         -- steps to stay close for termination
               }
-              deriving Show
+              deriving (Show, Generic)
+
+-- These instances are used to save/load state
+instance Serialize Dim
+instance Serialize Params
+instance Serialize GState
 
 -- Default params
 defSpsaParams :: Params
@@ -175,7 +195,7 @@ calcGrad verb play n ds = do
     when verb $ putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
     fm <- play xm
     when verb $ putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
-    let dgrad dim delta = dim { gra = (fp - fm) / delta / 2 }	-- gradient was too big!
+    let dgrad dim delta = dim { gra = (fp - fm) / delta / 2 }  -- gradient was too big!
         dgs = zipWith dgrad ds dx
     return dgs
 
@@ -185,12 +205,42 @@ doUntil act = go
               r <- act
               if r then return () else go
 
-ssSPSA :: Stochastic -> Params -> [((Double, Double), Double)] -> IO [Double]
-ssSPSA play params dlucs = liftM fst $ runStateT (spsa play) stat
-    where stat = GState { pars = params, dims = ds, oscs = os, step = 1,
-                          grde = 0, sstp = 0, cnxx = 0 }
-          ds = map (\((l, u), c) -> startDim params l u c) dlucs
-          os = take (length ds) $ repeat False
+ssSPSA :: Stochastic -> Maybe Params -> StartOptions -> IO [Double]
+ssSPSA play mparams staopts = do
+    stat <- case staopts of
+                SOStartWithCheckpoint file dlucs -> do
+                    let params = maybe defSpsaParams id mparams
+                        (ds, os) = dsos params dlucs
+                        stat = GState { pars = params, save = Just file, dims = ds, oscs = os,
+                                        step = 1, grde = 0, sstp = 0, cnxx = 0, rfil = "" }
+                    return stat
+                SOStartNoCheckpoint        dlucs -> do
+                    let params = maybe defSpsaParams id mparams
+                        (ds, os) = dsos params dlucs
+                        stat = GState { pars = params, save = Nothing, dims = ds, oscs = os,
+                                        step = 1, grde = 0, sstp = 0, cnxx = 0, rfil = "" }
+                    return stat
+                SORestart             file       -> do
+                    stat' <- restorePoint file
+                    let params = maybe (pars stat') id mparams  -- we can override params
+                        stat = stat' { pars = params, save = Just file }
+                    return stat
+    -- Write an empty file with a random number in name to be used for stopping
+    -- an optimisation run as soon as possible, but in a smooth way
+    -- If the file will be deleted, the optimisation will stop after the current step ends
+    -- If you have no checkpoint file, you will not be able to continue from there!
+    r <- runFileNum
+    let rfile = "running-" ++ show r
+    BL.writeFile rfile BL.empty
+    ds <- liftM fst $ runStateT (spsa play) stat { rfil = rfile }
+    removeFile rfile
+    return ds
+    where dsos ps xs = let ds = map (\((l, u), c) -> startDim ps l u c) xs
+                           os = take (length ds) $ repeat False
+                       in (ds, os)
+
+runFileNum :: IO Int
+runFileNum = getStdRandom (randomR (1000, 9999))
 
 spsa :: Stochastic -> Optim [Double]
 spsa play = do
@@ -199,7 +249,7 @@ spsa play = do
     gets $ map crt . dims
 
 scaleStep :: Stochastic -> Optim Bool
-scaleStep play = do
+scaleStep play = checkRunning $ do
     stat <- get
     let params = pars stat
     if step stat > h0 params || grde stat > gmax params || all id (oscs stat)
@@ -214,9 +264,9 @@ scaleStep play = do
        else do
            when (verb params) $ do
                info ""
-               info $ "Step " ++ show (step stat) ++ " (scale)"
+               info $ "*** Step " ++ show (step stat) ++ " (scale) ***"
                info $ "Crt = " ++ show (map crt $ dims stat)
-               info $ "calculate gradient..."
+               info $ "Calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
            d1s <- lift $ calcGrad (verb params) play nn (dims stat)
@@ -237,10 +287,11 @@ scaleStep play = do
                dns = map (nextStep nn) dcs
            when (verb params) $ info $ "Crt = " ++ show (map crt dns)
            put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
+           checkPoint
            return False
 
 shiftStep :: Stochastic -> Optim Bool
-shiftStep play = do
+shiftStep play = checkRunning $ do
     stat <- get
     let params = pars stat
     if step stat > nmax params     -- max number of steps
@@ -256,9 +307,9 @@ shiftStep play = do
        else do
            when (verb params) $ do
                info ""
-               info $ "Step " ++ show (step stat) ++ " (shift)"
+               info $ "*** Step " ++ show (step stat) ++ " (shift) ***"
                info $ "Crt = " ++ show (map crt $ dims stat)
-               info $ "calculate gradient..."
+               info $ "Calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
            d1s <- lift $ calcGrad (verb params) play nn (dims stat)
@@ -285,10 +336,36 @@ shiftStep play = do
                info $ "Crt = " ++ show (map crt dns)
                info $ "Dist1 = " ++ show xx
            put stat { dims = dns, step = step stat + 1, grde = grde stat + 1, sstp = near, cnxx = xx }
+           checkPoint
            return False
 
 info :: String -> Optim ()
 info = lift . putStrLn
+
+checkPoint :: Optim ()
+checkPoint = do
+    s <- get
+    case save s of
+        Nothing -> return ()
+        Just cp -> lift $ do
+            let cpn = addExtension cp "new"
+            BL.writeFile cpn $ encodeLazy s
+            renameFile cpn cp
+
+restorePoint :: FilePath -> IO GState
+restorePoint file = do
+    bs <- BL.readFile file
+    case decodeLazy bs of
+        Left estr -> error $ "Decode: " ++ estr
+        Right sta -> return sta
+
+checkRunning :: Optim Bool -> Optim Bool
+checkRunning act = do
+    s <- get
+    go <- lift $ doesFileExist (rfil s)
+    if go then act else do
+       lift $ putStrLn $ "Running file " ++ rfil s ++ " not found, stop optimisation"
+       return True
 
 ------------------------
 -- Test optimisations --
@@ -299,8 +376,8 @@ oneDim :: [Double] -> IO Double
 oneDim (x:_) = return $ 1 - 0.1 * (x+10) * (x+10)
 
 maxOneDimExact n = ssSPSA oneDim
-                          defSpsaParams { verb = True, nmax = n }
-                          [((-50, 100), 50)]
+                          (Just defSpsaParams { verb = True, nmax = n })
+                          (SOStartNoCheckpoint [((-50, 100), 50)])
 
 -- Same with noise: noise with a general level
 withNoise :: Double -> Stochastic -> [Double] -> IO Double
@@ -310,8 +387,8 @@ withNoise noise play xs = do
     return $ y + r
 
 maxOneDimNoise n = ssSPSA (withNoise 0.5 oneDim)
-                          defSpsaParams { verb = True, nmax = n }
-                          [((-50, 100), 50)]
+                          (Just defSpsaParams { verb = True, nmax = n })
+                          (SOStartNoCheckpoint [((-50, 100), 50)])
 
 -- 2 dimension: negated banana, no noise, (global) maximum at (1, 1)
 banana :: [Double] -> IO Double
@@ -321,5 +398,5 @@ banana (x:y:_) = return $ negate $ x1 * x1 + 10 * y1 * y1
           y1 = y - x2
 
 maxBanana n = ssSPSA banana
-                     defSpsaParams { nmax = n, mmax = n, xstp = 0.001 }
-                     [((-10, 10), 5), ((-10, 10), 5)]
+                     (Just defSpsaParams { nmax = n, mmax = n, xstp = 0.001 })
+                     (SOStartNoCheckpoint [((-10, 10), 5), ((-10, 10), 5)])
