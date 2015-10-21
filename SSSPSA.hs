@@ -50,6 +50,7 @@ data GState = GState {
                  pars :: Params,         -- we include the params in the state record
                  save :: Maybe FilePath, -- file to use for checkpoints
                  rfil :: FilePath,       -- running file name (delete to stop asap)
+                 -- rfdl :: Bool,           -- running file has to be deleted
                  dims :: [Dim],          -- per dimension state
                  oscs :: [Bool],         -- already oscillated dimensions
                  step :: !Int,           -- current step
@@ -212,13 +213,17 @@ ssSPSA play mparams staopts = do
                     let params = maybe defSpsaParams id mparams
                         (ds, os) = dsos params dlucs
                         stat = GState { pars = params, save = Just file, dims = ds, oscs = os,
-                                        step = 1, grde = 0, sstp = 0, cnxx = 0, rfil = "" }
+                                        step = 1, grde = 0, sstp = 0, cnxx = 0,
+                                        rfil = "" --, rfdl = True
+                                      }
                     return stat
                 SOStartNoCheckpoint        dlucs -> do
                     let params = maybe defSpsaParams id mparams
                         (ds, os) = dsos params dlucs
                         stat = GState { pars = params, save = Nothing, dims = ds, oscs = os,
-                                        step = 1, grde = 0, sstp = 0, cnxx = 0, rfil = "" }
+                                        step = 1, grde = 0, sstp = 0, cnxx = 0,
+                                        rfil = ""  -- , rfdl = True
+                                      }
                     return stat
                 SORestart             file       -> do
                     stat' <- restorePoint file
@@ -232,8 +237,8 @@ ssSPSA play mparams staopts = do
     r <- runFileNum
     let rfile = "running-" ++ show r
     BL.writeFile rfile BL.empty
-    ds <- liftM fst $ runStateT (spsa play) stat { rfil = rfile }
-    removeFile rfile
+    (ds, fs) <- runStateT (spsa play) stat { rfil = rfile }
+    -- when (rfdl fs) $ removeFile rfile
     return ds
     where dsos ps xs = let ds = map (\((l, u), c) -> startDim ps l u c) xs
                            os = take (length ds) $ repeat False
@@ -362,9 +367,10 @@ restorePoint file = do
 checkRunning :: Optim Bool -> Optim Bool
 checkRunning act = do
     s <- get
-    go <- lift $ doesFileExist (rfil s)
-    if go then act else do
+    rfe <- lift $ doesFileExist (rfil s)
+    if rfe then act else do
        lift $ putStrLn $ "Running file " ++ rfil s ++ " not found, stop optimisation"
+       -- put s { rfdl = False }
        return True
 
 ------------------------
