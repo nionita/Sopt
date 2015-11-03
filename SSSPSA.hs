@@ -42,7 +42,8 @@ data Dim = Dim {
                gra      :: !Double,     -- current gradient value
                nxt      :: !Double,     -- next value
                ash      :: !Int,        -- number of a shifts so far
-               csc      :: !Int         -- number of c sclaes so far
+               csc      :: !Int,        -- number of c scales so far
+               fin      :: !Bool        -- is dimension already final?
            }
            deriving (Show, Generic)
 
@@ -65,6 +66,7 @@ type Optim a = StateT GState IO a
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
                   verb :: !Bool,       -- verbose?
+                  inte :: !Bool,       -- integral parameters? (should be per dimension)
                   phia :: !Double,     -- maximal alpha scaling factor
                   c0   :: !Double,     -- define the maximum gamma: fraction from initial interval
                   gam0 :: !Double,     -- gamma scaling factor
@@ -87,8 +89,9 @@ instance Serialize GState
 
 -- Default params
 defSpsaParams :: Params
-defSpsaParams = Params { verb = False, phia = 10, c0 = 0.2, gam0 = 2, gami = 20, xstp = 1/1000000,
-                         nmax = 1000, h0 = 4, ka = 50, kc = 50, gmax = 20, mmax = 1000, nstp = 3 }
+defSpsaParams = Params { verb = False, inte = False, phia = 10, c0 = 0.2, gam0 = 2, gami = 20,
+                         xstp = 1/1000000, nmax = 1000, h0 = 4, ka = 50, kc = 50, gmax = 20,
+                         mmax = 1000, nstp = 3 }
 
 -- Initialisation per dimension
 -- Expects: low, high and current (start point)
@@ -96,7 +99,7 @@ startDim :: Params -> Double -> Double -> Double -> Dim
 startDim par l h c
     = Dim { low = l, hig = h, alf = 1, bet = 0, vak = 10,
             gam = (h - l) / gami par, cmx = c0 par * (h - l), crt = c,
-            gra = 0, nxt = 0, ash = 0, csc = 0 }
+            gra = 0, nxt = 0, ash = 0, csc = 0, fin = False }
 
 -- Calculate a(n) sequence
 ak :: Dim -> Double -> Double
@@ -165,10 +168,11 @@ nextPoint n dim = dim { nxt = x }
     where x = crt dim + ak dim n * gra dim
 
 -- Prepare next step, updating and projecting crt point
-nextStep :: Double -> Dim -> Dim
-nextStep n dim = dim { crt = x }
+nextStep :: Bool -> Double -> Dim -> Dim
+nextStep run n dim = dim { crt = x }
     where l = lbk dim (n+1)
           u = ubk dim (n+1)
+          -- x = roundd run $ min u $ max l $ nxt dim
           x = min u $ max l $ nxt dim
 
 -- The norm for the termination condition
@@ -183,21 +187,32 @@ randSign = do
         1 -> return r
         2 -> return (-1)
 
+-- When integral dimensions: round
+roundd :: Bool -> Double -> Double
+roundd run x
+    | run       = fromIntegral x0
+    | otherwise = x
+    where x0 :: Int
+          x0 = round x
+
 -- Calculate gradient
-calcGrad :: Bool -> Stochastic -> Double -> [Dim] -> IO [Dim]
-calcGrad verb play n ds = do
+calcGrad :: Bool -> Bool -> Stochastic -> Double -> [Dim] -> IO [Dim]
+calcGrad verb run play n ds = do
     let xs = map crt ds
     dx <- forM ds $ \dim -> do
               d <- randSign
               return $ fromIntegral d * ck dim n
-    let xp = zipWith (+)      dx xs
-        xm = zipWith subtract dx xs
+    let xp = map (roundd run) $ zipWith (+)      dx xs
+        xm = map (roundd run) $ zipWith subtract dx xs
     fp <- play xp
     when verb $ putStrLn $ "Func + at " ++ show xp ++ ": " ++ show fp
     fm <- play xm
     when verb $ putStrLn $ "Func - at " ++ show xm ++ ": " ++ show fm
-    let dgrad dim delta = dim { gra = (fp - fm) / delta / 2 }  -- gradient was too big!
-        dgs = zipWith dgrad ds dx
+    let dgrad dim delta
+            | fin dim    = dim { gra = 0 }
+            | delta == 0 = dim { gra = 0, fin = True }
+            | otherwise  = dim { gra = (fp - fm) / delta }
+        dgs = zipWith dgrad ds $ zipWith subtract xm xp
     return dgs
 
 doUntil :: Monad m => m Bool -> m ()
@@ -257,59 +272,48 @@ scaleStep :: Stochastic -> Optim Bool
 scaleStep play = checkRunning $ do
     stat <- get
     let params = pars stat
-    if step stat > h0 params || grde stat > gmax params || all id (oscs stat)
-       then do
-           when (verb params) $ do
-               if step stat > h0 params
-                  then info $ "Scaling termination: h0 steps reached"
-                  else if grde stat > gmax params
-                          then info $ "Scaling termination: max gradient reached"
-                          else info $ "Scaling termination: all dimensions scaled"
-           return True
-       else do
-           when (verb params) $ do
-               info ""
-               info $ "*** Step " ++ show (step stat) ++ " (scale) ***"
-               info $ "Crt = " ++ show (map crt $ dims stat)
-               info $ "Calculate gradient..."
-           let nn = fromIntegral $ step stat
-           -- Calculate gradient at current point
-           d1s <- lift $ calcGrad (verb params) play nn (dims stat)
-           when (verb params) $ info $ "Gra = " ++ show (map gra d1s)
-           let -- next point (not adjusted to the limits)
-               ds = map (nextPoint nn) d1s
-           when (verb params) $ info $ "Nxt = " ++ show (map nxt ds)
-           let -- a sequence scaling
-               fas osc dim | osc       = (osc, dim)     -- already oscillated
-                           | otherwise = ascalStep params nn dim
-               (oas, das) = unzip $ zipWith fas (oscs stat) ds
-           when (verb params) $ info $ "Alf = " ++ show (map alf das)
-           let -- c sequence scaling
-               dcs | step stat > mmax params = das
-                   | otherwise               = map (cscalStep params nn) das
-           when (verb params) $ info $ "Gam = " ++ show (map gam dcs)
-           let -- next point
-               dns = map (nextStep nn) dcs
-           when (verb params) $ info $ "Crt = " ++ show (map crt dns)
-           put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
-           checkPoint
-           return False
+    checkEnd (verb params) (step stat > h0 params) "Scaling termination: h0 steps reached" $
+      checkEnd (verb params) (grde stat > gmax params) "Scaling termination: max gradient reached" $
+        checkEnd (verb params) (all id (oscs stat)) "Scaling termination: all dimensions scaled" $
+          checkEnd (verb params) (all fin (dims stat)) "Scaling termination: all dimensions done" $ do
+            when (verb params) $ do
+                info ""
+                info $ "*** Step " ++ show (step stat) ++ " (scale) ***"
+                info $ "Crt = " ++ show (map crt $ dims stat)
+                info $ "Calculate gradient..."
+            let nn = fromIntegral $ step stat
+            -- Calculate gradient at current point
+            d1s <- lift $ calcGrad (verb params) False play nn (dims stat)
+            when (verb params) $ info $ "Gra = " ++ show (map gra d1s)
+            let -- next point (not adjusted to the limits)
+                ds = map (nextPoint nn) d1s
+            when (verb params) $ info $ "Nxt = " ++ show (map nxt ds)
+            let -- a sequence scaling
+                fas osc dim | osc       = (osc, dim)     -- already oscillated
+                            | otherwise = ascalStep params nn dim
+                (oas, das) = unzip $ zipWith fas (oscs stat) ds
+            when (verb params) $ info $ "Alf = " ++ show (map alf das)
+            let -- c sequence scaling
+                dcs | step stat > mmax params = das
+                    | otherwise               = map (cscalStep params nn) das
+            when (verb params) $ info $ "Gam = " ++ show (map gam dcs)
+            let -- next point
+                dns = map (nextStep (inte params) nn) dcs
+            when (verb params) $ info $ "Crt = " ++ show (map crt dns)
+            put stat { dims = dns, oscs = oas, step = step stat + 1, grde = grde stat + 1 }
+            checkPoint
+            return False
 
 shiftStep :: Stochastic -> Optim Bool
 shiftStep play = checkRunning $ do
     stat <- get
     let params = pars stat
-    if step stat > nmax params     -- max number of steps
-       || (cnxx stat < xstp params && sstp stat >= nstp params)
-       then do
-           when (verb params) $ do
-               if step stat > nmax params
-                  then info $ "Termination: nmax steps reached"
-                  else info $ "Termination: optimum near enough"
-               info $ "Crt = " ++ show (map crt (dims stat))
-               info $ "Dims = " ++ show (dims stat)
-           return True
-       else do
+    checkEnd (verb params) (step stat > nmax params) "Termination: nmax steps reached" $
+      checkEnd (verb params) (cnxx stat < xstp params && sstp stat >= nstp params)
+       "Termination: optimum near enough" $
+       checkEnd (verb params) (all fin (dims stat)) "Termination: all dimensions done" $ do
+           --  info $ "Crt = " ++ show (map crt (dims stat))
+           --  info $ "Dims = " ++ show (dims stat)
            when (verb params) $ do
                info ""
                info $ "*** Step " ++ show (step stat) ++ " (shift) ***"
@@ -317,7 +321,7 @@ shiftStep play = checkRunning $ do
                info $ "Calculate gradient..."
            let nn = fromIntegral $ step stat
            -- Calculate gradient at current point
-           d1s <- lift $ calcGrad (verb params) play nn (dims stat)
+           d1s <- lift $ calcGrad (verb params) (inte params) play nn (dims stat)
            when (verb params) $ info $ "Gra = " ++ show (map gra d1s)
            let -- next point (not adjusted to the limits)
                ds = map (nextPoint nn) d1s
@@ -334,7 +338,7 @@ shiftStep play = checkRunning $ do
            when (verb params) $ info $ "Gam = " ++ show (map gam dcs)
            let -- next point, distance in parameter space (for termination)
                xx  = dist1 (map crt dcs) (map nxt dcs)
-               dns = map (nextStep nn) dcs
+               dns = map (nextStep (inte params) nn) dcs
                near | xx < xstp params = sstp stat + 1
                     | otherwise        = 0
            when (verb params) $ do
@@ -346,6 +350,13 @@ shiftStep play = checkRunning $ do
 
 info :: String -> Optim ()
 info = lift . putStrLn
+
+checkEnd :: Bool -> Bool -> String -> Optim Bool -> Optim Bool
+checkEnd verb cond mes act
+    | cond      = do
+        when verb $ info mes
+        return True
+    | otherwise = act
 
 checkPoint :: Optim ()
 checkPoint = do
