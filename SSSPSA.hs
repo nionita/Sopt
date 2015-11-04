@@ -101,13 +101,21 @@ startDim par l h c
             gam = (h - l) / gami par, cmx = c0 par * (h - l), crt = c,
             gra = 0, nxt = 0, ash = 0, csc = 0, fin = False }
 
+-- Spal says these practical effective values should be used
+-- which are not in the SS-SPSS paper:
+aexp, aexpi, cexp :: Double
+aexp  = 0.602
+aexpi = 1 / aexp
+cexp  = 0.101
+
 -- Calculate a(n) sequence
 ak :: Dim -> Double -> Double
-ak dim n = alf dim / (n + bet dim)
+ak dim n = alf dim / (n + bet dim) ** aexp
 
 -- Calculate c(n) sequence
 ck :: Dim -> Double -> Double
-ck dim n = gam dim / (sqrt $ sqrt n)
+-- ck dim n = gam dim / (sqrt $ sqrt n)
+ck dim n = gam dim / n ** cexp
 
 -- Calculate lower bound
 lbk :: Dim -> Double -> Double
@@ -130,8 +138,9 @@ ascalStep par n dim = (s, dim { alf = a })
 ascal :: Params -> Double -> Double -> Dim -> (Bool, Double)
 ascal par lim n dim
     | f > phia par = (False, alf dim * phia par)  -- limited scaling
-    | f < 1        = (True,  alf dim)             -- no scaling needed
-    | otherwise    = (True,  al1)                 -- exact scaling
+    | f >= 1       = (True,  al1)                 -- exact scaling
+    | f > 0        = (True,  alf dim)             -- no scaling needed
+    | otherwise    = (False, alf dim)             -- not the correct direction
     where al1 = (lim - crt dim) / (nxt dim - crt dim)
           f   = al1 / alf dim
 
@@ -139,19 +148,21 @@ ascal par lim n dim
 -- We expect here that the nxt field is not yet adjusted to the limits
 bshiftStep :: Params -> Double -> Dim -> Dim
 bshiftStep par n dim
-    | ash dim >= ka par                 = dim
-    | crt dim <= l1 && nxt dim > u2     = beshi u2
-    | crt dim >= u1 && nxt dim < l2     = beshi l2
-    | otherwise                         = dim
+    | ash dim >= ka par             = dim
+    | gra dim == 0                  = dim
+    | crt dim <= l1 && nxt dim > u2 = beshi u2
+    | crt dim >= u1 && nxt dim < l2 = beshi l2
+    | otherwise                     = dim
     where l1 = lbk dim n
           u1 = ubk dim n
           l2 = lbk dim (n+1)
           u2 = ubk dim (n+1)
-          bshift delta = ceiling (alf dim * gra dim / delta - n - bet dim)
-          beshi r = dim { bet = b, vak = v, ash = ash dim + 1 }
-              where b' = fromIntegral $ bshift $ r - crt dim
+          bshift r = ceiling (((alf dim / r) ** aexpi) - n - bet dim)  -- r > 0, should be ok
+          beshi li = dim { bet = b, vak = v, ash = ash dim + 1 }       -- ----\
+              where b' = fromIntegral $ bshift $ (li - crt dim) / gra dim  -- coz grd takes care
                     (bp, v) | b' > vak dim = (vak dim, vak dim * 2)
-                            | otherwise    = (b',      vak dim)
+                            | b' > 0       = (b',      vak dim)
+                            | otherwise    = (0,       vak dim)
                     b = bet dim + bp
 
 cscalStep :: Params -> Double -> Dim -> Dim
