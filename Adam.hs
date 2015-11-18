@@ -56,6 +56,7 @@ type Optim a = StateT GState IO a
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
                   verb :: !Bool,       -- verbose?
+                  cent :: !Bool,       -- central second momentum?
                   alfa :: !Double,     -- alpha step size
                   bet1 :: !Double,     -- exponential decay for first order momentum
                   bet2 :: !Double,     -- exponential decay for second order momentum
@@ -73,25 +74,28 @@ instance Serialize GState
 
 -- Default params
 defAdamParams :: Params
-defAdamParams = Params { verb = False, alfa = 0.001, bet1 = 0.9, bet2 = 0.999, epsi = 1E-8,
-                         xstp = 1/1000, nmax = 1000, nstp = 3 }
+defAdamParams = Params { verb = False, alfa = 0.01, bet1 = 0.9, bet2 = 0.999, epsi = 1,
+                         xstp = 1/1000, nmax = 1000, nstp = 3, cent = False }
 
 -- Initialisation per dimension
 -- Expects: current (start point), gradient delta
 startDim :: Double -> Double -> Dim
 startDim c d = Dim { crt = c, del = d, gra = 0, nxt = 0, frm = 0, srm = 0 }
 
-nextMoment :: Params -> Dim -> Dim
-nextMoment pars dim = dim { frm = m1, srm = m2 }
+nextMoment :: Params -> Double -> Dim -> Dim
+nextMoment pars b1n dim = dim { frm = m1, srm = m2 }
     where m1 = bet1 pars * frm dim + (1 - bet1 pars) * gra dim
-          m2 = bet2 pars * srm dim + (1 - bet2 pars) * gra dim * gra dim
+          m2 | cent pars = let m' = m1 / (1 - b1n)
+                               gd = gra dim - m'
+                           in bet2 pars * srm dim + (1 - bet2 pars) * gd * gd
+             | otherwise = bet2 pars * srm dim + (1 - bet2 pars) * gra dim * gra dim
 
 -- Adding here means: we maximise
 nextPoint :: Params -> Double -> Double -> Dim -> Dim
 nextPoint pars b1n b2n dim = dim { nxt = x }
     where m = frm dim / (1 - b1n)
           v = srm dim / (1 - b2n)
-          x = crt dim + alfa pars * frm dim / (sqrt (srm dim) + epsi pars)
+          x = crt dim + alfa pars * m / (sqrt v + epsi pars)   -- v = 0 ==> step = alpha * m
 
 -- Prepare next step, updating and projecting crt point
 nextStep :: Dim -> Dim
@@ -195,7 +199,7 @@ optimStep play = checkRunning $ do
            let -- update the momentum per dimension
                b1n' = b1n stat * bet1 params
                b2n' = b2n stat * bet2 params
-               dms = map (nextMoment params) dgs
+               dms = map (nextMoment params b1n') dgs
            when (verb params) $ do
                info $ "Mo1 = " ++ show (map frm dms)
                info $ "Mo2 = " ++ show (map srm dms)

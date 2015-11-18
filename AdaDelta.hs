@@ -48,7 +48,8 @@ data GState = GState {
                  dims :: [Dim],          -- per dimension state
                  step :: !Int,           -- current step
                  sstp :: !Int,           -- steps close to termination
-                 cnxx :: !Double         -- distance between crt & nxt
+                 cnxx :: !Double,        -- distance between crt & nxt
+                 betn :: !Double         -- bias correction for exponetial decay vars
              } deriving Generic
 
 -- Our monad stack
@@ -57,6 +58,7 @@ type Optim a = StateT GState IO a
 -- Some parameter of the algorithm (remain constant during one execution):
 data Params = Params {
                   verb :: !Bool,       -- verbose?
+                  alfa :: !Double,     -- step size factor
                   beta :: !Double,     -- exponential decay for RMS
                   epsi :: !Double,     -- to limit the update step
                   xstp :: !Double,     -- termination when max(n) (xn - xc) < xstp
@@ -72,7 +74,7 @@ instance Serialize GState
 
 -- Default params
 defAdaDeltaParams :: Params
-defAdaDeltaParams = Params { verb = False, beta = 0.95, epsi = 1E-6,
+defAdaDeltaParams = Params { verb = False, alfa = 1, beta = 0.95, epsi = 1E-6,
                              xstp = 1E-6, nmax = 1000, nstp = 10 }
 
 -- Initialisation per dimension
@@ -83,14 +85,21 @@ startDim c d = Dim { crt = c, del = d, gra = 0, grm = 0, nxt = 0, dex = 0, edx2 
 rms :: Params -> Double -> Double
 rms pars x = sqrt (x + epsi pars)
 
-accumGrad :: Params -> Dim -> Dim
-accumGrad pars dim = dim { grm = g, eg2 = x }
-    where g = beta pars * grm dim + (1 - beta pars) * gra dim
-          x = beta pars * eg2 dim + (1 - beta pars) * g * g
+corm :: Double -> Double -> Double
+corm b x = x / (1 - b)
 
-compUpdate :: Params -> Dim -> Dim
-compUpdate pars dim = dim { dex = x }
-    where x = grm dim * rms pars (edx2 dim) / rms pars (eg2 dim)
+accumGrad :: Params -> Double -> Dim -> Dim
+accumGrad pars bn dim = dim { grm = g, eg2 = x }
+    where g  = beta pars * grm dim + (1 - beta pars) * gra dim
+          g' = corm bn g
+          x  = beta pars * eg2 dim + (1 - beta pars) * g' * g'
+
+compUpdate :: Params -> Double -> Dim -> Dim
+compUpdate pars bn dim = dim { dex = x }
+    where g  = corm bn (grm dim)
+          g2 = corm bn (eg2 dim)
+          x2 = corm bn (edx2 dim)
+          x  = alfa pars * g * rms pars x2 / rms pars g2
 
 accumUpdate :: Params -> Dim -> Dim
 accumUpdate pars dim = dim { edx2 = x }
@@ -148,14 +157,14 @@ adaDelta play mparams staopts = do
                     let params = maybe defAdaDeltaParams id mparams
                         ds = map (uncurry startDim) dlucs
                         stat = GState { pars = params, save = Just file, dims = ds,
-                                        step = 1, sstp = 0, cnxx = 0, rfil = ""
+                                        step = 1, sstp = 0, cnxx = 0, betn = 1, rfil = ""
                                       }
                     return stat
                 SOStartNoCheckpoint        dlucs -> do
                     let params = maybe defAdaDeltaParams id mparams
                         ds = map (uncurry startDim) dlucs
                         stat = GState { pars = params, save = Nothing, dims = ds,
-                                        step = 1, sstp = 0, cnxx = 0, rfil = ""
+                                        step = 1, sstp = 0, cnxx = 0, betn = 1, rfil = ""
                                       }
                     return stat
                 SORestart             file       -> do
@@ -195,17 +204,17 @@ optimStep play = checkRunning $ do
                info $ "*** Step " ++ show (step stat) ++ " ***"
                info $ "Crt = " ++ show (map crt $ dims stat)
                info $ "Calculate gradient..."
-           let nn = fromIntegral $ step stat
+           let bn = betn stat * beta params
            -- Calculate gradient at current point
            dgs <- lift $ calcGrad (verb params) play (dims stat)
            when (verb params) $ info $ "Gra = " ++ show (map gra dgs)
            let -- accumulate gradients per dimension
-               dag = map (accumGrad params) dgs
+               dag = map (accumGrad params bn) dgs
            when (verb params) $ do
                info $ "Grm = " ++ show (map grm dag)
                info $ "Eg2 = " ++ show (map eg2 dag)
            let -- compute updates per dimension
-               dcu = map (compUpdate params) dag
+               dcu = map (compUpdate params bn) dag
            when (verb params) $ info $ "Dx  = " ++ show (map dex dcu)
            let -- accumulate updates per dimension
                dau = map (accumUpdate params) dcu
@@ -219,7 +228,7 @@ optimStep play = checkRunning $ do
                near | xx < xstp params = sstp stat + 1
                     | otherwise        = 0
            when (verb params) $ info $ "Dist1 = " ++ show xx
-           put stat { dims = dns, step = step stat + 1, sstp = near, cnxx = xx }
+           put stat { dims = dns, step = step stat + 1, sstp = near, cnxx = xx, betn = bn }
            checkPoint
            return False
 
