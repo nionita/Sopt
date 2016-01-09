@@ -10,7 +10,7 @@ name:                Sopt
 -- PVP summary:      +-+------- breaking API changes
 --                   | | +----- non-breaking API additions
 --                   | | | +--- code changes with no API change
-version:             0.1.0.0
+version:             0.2.0.0
 
 -- A short (one-line) description of the package.
 synopsis:            Stochastic optimisations
@@ -48,7 +48,11 @@ cabal-version:       >=1.10
 
 library
   -- Modules exported by the library.
-  exposed-modules:     SSSPSA, Adam, AdaDelta, Newton, Radius, Radexp
+  exposed-modules:     SSSPSA,
+                       Optimisation.Stochastic.Common,
+                       Optimisation.Stochastic.Adam,
+                       Optimisation.Stochastic.AdaDelta,
+                       Newton, Radius, Radexp
   
   -- Modules included in this library but not exported.
   -- other-modules:       
@@ -59,7 +63,7 @@ library
   -- Other library packages from which modules are imported.
   build-depends:       base >=4.8 && <4.9, random >=1.1,
                        transformers, bytestring, cereal, 
-                       directory, filepath
+                       directory, filepath, data-default
   
   -- Directories containing source files.
   -- hs-source-dirs:      
